@@ -1,0 +1,126 @@
+def service = 'tms-rating-domain'
+def branch = 'develop'
+def profile = 'dev'
+def customImage
+def dev_k8s_api_server
+def latestTag
+
+pipeline {
+
+  agent any
+
+  options {
+    buildDiscarder(logRotator(numToKeepStr: '5'))
+    skipDefaultCheckout true
+  }
+  tools {
+    jdk 'Java11'
+    maven 'M3'
+  }
+  stages {
+    stage('Setup Workspace') {
+      steps {
+        cleanWs()
+      }
+    }
+    stage('Checkout SCM') {
+      steps {
+        git(url: "https://github.com/Sagar5255/springproject.git", branch: "${branch}", credentialsId: "mgadmin")
+        script {
+          git_rev_count = sh(script: "git rev-list --all --count", returnStdout: true).trim()
+        }
+      }
+    }
+    stage('Build & Package') {
+      steps {
+        script {
+          sh("mvn -Dintegration-tests.skip=true -Dmaven.javadoc.skip=true -Dspring.profiles.active=dev -Dbuild.number=${BUILD_NUMBER} clean package")
+        }
+      }
+    }
+    stage('SonarQube Analysis') {
+      steps {
+        script {
+          withSonarQubeEnv {
+            sh("mvn verify sonar:sonar -Dintegration-tests.skip=false -Dmaven.test.failure.ignore=true")
+          }
+        }
+      }
+    }
+    stage('Docker Build') {
+      steps {
+        script {
+          customImage = docker.build("mercurygate/tms-rating-domain:${env.BUILD_ID}-${branch}", ".")
+        }
+      }
+    }
+    stage('Docker Push') {
+      steps {
+        script {
+          docker.withRegistry("https://docker-snapshot-local.artifactory.mgdev.loc", "art-jenkins") {
+            customImage.push("${env.BUILD_ID}-${branch}")
+            sh("docker rmi -f mercurygate/tms-rating-domain:${env.BUILD_ID}-${branch}")
+          }
+        }
+      }
+    }
+    stage('Set docker repository') {
+      steps {
+        withCredentials([string(credentialsId: "dev_k8s_api_server", variable: 'dev_k8s_api_server')]) {
+          script {
+            //repository_url = env.repository_url
+            dev_k8s_api_server = env.dev_k8s_api_server
+          }
+        }
+      }
+    }
+    stage('Get helm release status') {
+      steps {
+        withCredentials([string(credentialsId: 'dev-k8s-jenkins-sa', variable: 'token'),
+          file(credentialsId: 'dev_k8s_ca_crt', variable: 'dev_k8s_ca_crt')
+        ]) {
+          script {
+            status = sh(
+              script: "helm upgrade --install dev ./k8s/helm/tms-rating-domain -n tms-rating-domain --values ./k8s/helm/dev_values.yaml --set image.tag=${env.BUILD_ID}-${branch} " +
+              "--kube-token ${env.token} " +
+              "--kube-ca-file=${env.dev_k8s_ca_crt} " +
+              "--kube-apiserver ${dev_k8s_api_server} " +
+              "|| true",
+              returnStdout: true
+            ).trim()
+            if ("${status}".contains("STATUS")) {
+              action = 'upgrade'
+            } else {
+              action = 'install'
+            }
+          }
+        }
+      }
+    }
+  }
+  post {
+  	always{
+  		cleanWs()
+  	}
+  	success {
+        slackSend (color: '#00FF00', message: "Successful: Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]' (${env.BUILD_URL})")
+        emailext (
+            to: "sagar3245@gmail.com",
+            subject: "Successful: Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]'",
+            body: """<p>Successful: Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]':</p>
+              <p>Check console output at </p><p><a href='${env.BUILD_URL}'>${env.JOB_NAME} [${env.BUILD_NUMBER}]</a></p>""",
+            recipientProviders: [[$class: 'DevelopersRecipientProvider']]
+          )
+      }
+      failure {
+        slackSend (color: '#0FF000', message: "FAILED: Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]' (${env.BUILD_URL})")
+        emailext (
+            to: "sagar3245@gmail.com",
+            subject: "Failed: Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]'",
+            body: """<p>Failed: Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]':</p>
+              <p>Check console output at </p><p><a href='${env.BUILD_URL}'><${env.JOB_NAME} [${env.BUILD_NUMBER}]</a>;</p>""",
+            recipientProviders: [[$class: 'DevelopersRecipientProvider']]
+        )
+      }
+    }
+}
